@@ -254,8 +254,8 @@ header{position:sticky;top:0;z-index:20;background:transparent;padding:0}
   </div>
   <div id="mlist"></div>
   <div class="grp">
-    <div class="row" id="mFile"><span>从文件导入</span><span class="val">PDF / Excel ›</span></div>
-    <input type="file" id="mFileInput" accept=".pdf,.xlsx,.xls,.csv,application/pdf" style="display:none">
+    <div class="row" id="mFile"><span>从文件导入</span><span class="val">PDF / Excel / HTML ›</span></div>
+    <input type="file" id="mFileInput" accept=".pdf,.xlsx,.xls,.csv,.html,.htm,application/pdf" style="display:none">
     <div class="row" id="mImp"><span>导入分享码</span><span class="val">›</span></div>
     <div class="row" id="mExp"><span>生成分享码</span><span class="val">›</span></div>
     <div class="row" id="mReset"><span>恢复内置课表</span><span class="val">›</span></div>
@@ -872,6 +872,142 @@ document.getElementById('mReset').onclick = function(){
   saveData(); renderMgmt(); paint();
 };
 
+/* ===== HTML 课表解析 ===== */
+function htmlCellText(cell){
+  var raw = (cell && cell.innerHTML) || '';
+  var s = raw.replace(/<br\s*\/?>/gi, '\n')
+             .replace(/<\/(div|p|li|tr|td|span)>/gi, '\n')
+             .replace(/<[^>]+>/g, '');
+  var ta = document.createElement('textarea');
+  ta.innerHTML = s;
+  return (ta.value || '').replace(/\u00a0/g, ' ');
+}
+
+function htmlCellCourses(text, day, s, e){
+  var lines = String(text).split(/\n+/).map(function(x){ return x.trim(); }).filter(Boolean);
+  if (!lines.length) return null;
+  var joined = lines.join(' ');
+  if (/^(上午|下午|晚上|中午|节次|时间|星期一|星期二|星期三|星期四|星期五|星期六|星期日)$/.test(joined)) return null;
+  if (lines.length < 2 && !/周/.test(joined)) return null;
+
+  var weeksText = '1-16周';
+  var mw = joined.match(/(\d+(?:\s*[-~—]\s*\d+)?(?:\s*[,，]\s*\d+(?:\s*[-~—]\s*\d+)?)*)\s*周\s*[（(]?\s*(单|双)?\s*[）)]?/);
+  if (mw) weeksText = mw[1].replace(/\s/g, '') + (mw[2] ? '(' + mw[2] + ')' : '') + '周';
+
+  var room = '';
+  var mr = joined.match(/([A-Z]{1,4}\d{1,3}\s*[-–]\s*\d{2,4})/) ||
+           joined.match(/(?:教室|地点|上课地点)\s*[:：]?\s*([^\s，,]+)/);
+  if (mr) room = mr[1].replace(/\s/g, '');
+
+  var name = lines[0].replace(/[★●◆◇○]/g, '').trim();
+  if (!name || /周/.test(name) && name.length < 12) name = name.replace(/\d+.*$/, '').trim() || lines[0];
+  var teacher = '';
+  for (var i = 1; i < lines.length; i++){
+    var t = lines[i].replace(/[★●◆◇○]/g, '').trim();
+    if (/^\d/.test(t) || /周/.test(t) || t === room) continue;
+    if (/^[\u4e00-\u9fa5]{2,4}$/.test(t)){ teacher = t; break; }
+  }
+  if (!room){
+    for (var j = 1; j < lines.length; j++){
+      var t2 = lines[j].replace(/[★●◆◇○]/g, '').trim();
+      if (/周/.test(t2)) continue;
+      if (/^[A-Za-z]{1,6}\d{1,5}([-–]\d{1,4})?$/.test(t2) ||
+          /[\u4e00-\u9fa5]{1,10}(楼|室|馆|校区|栋|广场)/.test(t2)){ room = t2; break; }
+    }
+  }
+  return { name: name, day: day, jcs: [s, e], weeksText: weeksText, room: room, teacher: teacher };
+}
+
+function coursesFromHtml(html){
+  var doc = new DOMParser().parseFromString(String(html), 'text/html');
+  var tables = doc.querySelectorAll('table');
+  var best = null, bestScore = 0;
+  Array.prototype.forEach.call(tables, function(t){
+    var rows = t.rows.length, cols = 0;
+    for (var i = 0; i < rows; i++) cols = Math.max(cols, t.rows[i].cells.length);
+    if (cols >= 7 && rows >= 3 && rows * cols > bestScore){ best = t; bestScore = rows * cols; }
+  });
+
+  var out = [];
+  if (best){
+    var rows = best.rows, grid = [];
+    for (var r = 0; r < rows.length; r++){
+      grid[r] = grid[r] || [];
+      var cs = rows[r].cells, ci = 0;
+      for (var k = 0; k < cs.length; k++){
+        while (grid[r][ci]) ci++;
+        var cell = cs[k], span = cell.rowSpan || 1, cspan = cell.colSpan || 1;
+        var txt = htmlCellText(cell);
+        for (var a = 0; a < span; a++){
+          grid[r + a] = grid[r + a] || [];
+          for (var b = 0; b < cspan; b++){
+            grid[r + a][ci + b] = { text: txt, rs: span, origin: a === 0 && b === 0 };
+          }
+        }
+        ci += cspan;
+      }
+    }
+    var headerRow = -1, dayCols = {};
+    for (var r2 = 0; r2 < grid.length && headerRow < 0; r2++){
+      var found = 0, map = {};
+      for (var c = 0; c < (grid[r2] || []).length; c++){
+        var t2 = ((grid[r2][c] || {}).text || '').replace(/\s/g, '');
+        var m = t2.match(/^(?:星期|周)([一二三四五六日天])$/);
+        if (m){ map[c] = '一二三四五六日'.indexOf(m[1]) + 1; found++; }
+      }
+      if (found >= 3){ headerRow = r2; dayCols = map; }
+    }
+    if (headerRow >= 0){
+      var period = 0;
+      for (var r3 = headerRow + 1; r3 < grid.length; r3++){
+        var row = grid[r3] || [];
+        var first = ((row[0] || {}).text || '').replace(/\s/g, '');
+        var num = first.match(/^(\d{1,2})$/);
+        if (num) period = +num[1];
+        else {
+          var range = first.match(/^(\d{1,2})\s*[-–]\s*(\d{1,2})$/);
+          if (range) period = +range[1];
+        }
+        if (!period) continue;
+        for (var c2 in dayCols){
+          var cell2 = row[+c2];
+          if (!cell2 || !cell2.text || !cell2.origin) continue;
+          var end = period + (cell2.rs || 1) - 1;
+          var co = htmlCellCourses(cell2.text, dayCols[c2], period, end);
+          if (co) out.push(co);
+        }
+      }
+    }
+  }
+
+  // 兜底：纯文本里抓「周X第A,B节」
+  if (!out.length){
+    var body = doc.body || doc.documentElement;
+    var text = htmlCellText(body);
+    var lines = text.split(/\n+/).map(function(x){ return x.trim(); }).filter(Boolean);
+    for (var i = 0; i < lines.length; i++){
+      var m3 = lines[i].match(/(?:星期|周)([一二三四五六日天])\s*第\s*(\d+)\s*[,，\-~]?\s*(\d+)?\s*节/);
+      if (m3){
+        var day = '一二三四五六日'.indexOf(m3[1]) + 1;
+        var s3 = +m3[2], e3 = m3[3] ? +m3[3] : s3;
+        var head = lines[i].split(/(?:星期|周)[一二三四五六日天]/)[0].trim();
+        var c3 = htmlCellCourses((head ? head + '\n' : '') + lines[i], day, s3, e3);
+        if (c3) out.push(c3);
+      }
+    }
+  }
+
+  out.forEach(function(c){
+    c.dayName = '星期' + '一二三四五六日'.charAt(c.day - 1);
+    c.weeks = parseWeeks(c.weeksText);
+    c.campus = c.campus || '';
+    c.exam = c.exam || '';
+    c.credit = c.credit || '';
+    c.klass = c.klass || '';
+  });
+  return out;
+}
+
 /* ===== 从文件导入：PDF / Excel / CSV ===== */
 var __pdfP = null, __xlsxP = null;
 function loadScript(src){
@@ -1039,6 +1175,12 @@ document.getElementById('mFileInput').onchange = function(e){
       }).catch(fail);
     };
     reader.readAsArrayBuffer(f);
+  } else if (/\.(html|htm)$/.test(nm)){
+    reader.onload = function(){
+      try { applyImported(coursesFromHtml(String(reader.result || ''))); }
+      catch (err) { fail(err); }
+    };
+    reader.readAsText(f, 'utf-8');
   } else if (/\.(xlsx|xls|csv)$/.test(nm)){
     reader.onload = function(){
       var done = function(rows){ applyImported(coursesFromRows(rows)); };
@@ -1056,7 +1198,7 @@ document.getElementById('mFileInput').onchange = function(e){
     };
     reader.readAsArrayBuffer(f);
   } else {
-    alert('只支持 .pdf / .xlsx / .xls / .csv');
+    alert('只支持 .pdf / .xlsx / .xls / .csv / .html');
   }
   e.target.value = '';
 };
